@@ -31,78 +31,121 @@ AI_KEYWORDS = [
     "cursor", "bolt", "cohere", "midjourney", "sora", "veo",
 ]
 MAX_STORIES = 10
-SUMMARY_MAX_CHARS = 500
+SUMMARY_TARGET_LINES = 8
+SUMMARY_MAX_CHARS = 900
 
 
 def keyword_score(text: str) -> int:
     return sum(1 for kw in AI_KEYWORDS if kw in text.lower())
 
 
-class SummaryExtractor(HTMLParser):
+class ContentExtractor(HTMLParser):
     def __init__(self):
         super().__init__()
-        self._capture = False
-        self._depth = 0
         self._skip = 0
-        self._texts = []
+        self._paragraphs = []
+        self._current_p = []
+        self._in_p = False
         self._meta_desc = None
-        self._in_tag = None
+        self._article_text = []
+        self._in_article = False
+        self._article_depth = 0
 
     def handle_starttag(self, tag, attrs):
-        attrs_dict = dict(attrs)
+        a = dict(attrs)
         if tag == "meta":
-            name = attrs_dict.get("name", "").lower()
-            prop = attrs_dict.get("property", "").lower()
-            if name == "description" or prop == "og:description":
-                self._meta_desc = attrs_dict.get("content", "")
+            n = a.get("name", "").lower()
+            p = a.get("property", "").lower()
+            if n == "description" or p == "og:description":
+                self._meta_desc = a.get("content", "")
             return
-        if tag in ("script", "style", "nav", "header", "footer"):
+        if tag in ("script", "style", "noscript"):
             self._skip += 1
             return
-        if tag == "p" and self._skip == 0 and not self._texts:
-            self._capture = True
-            self._depth = 1
+        if tag == "article":
+            self._in_article = True
+            self._article_depth = 1
+            return
+        if self._in_article and tag == "p" and self._skip == 0:
+            self._in_p = True
+            return
+        if not self._in_article:
+            if tag == "p" and self._skip == 0:
+                self._in_p = True
+            elif tag in ("div", "section") and not self._paragraphs:
+                pass
 
     def handle_endtag(self, tag):
-        if tag in ("script", "style", "nav", "header", "footer"):
+        if tag in ("script", "style", "noscript"):
             self._skip -= 1
             return
-        if tag == "p" and self._capture:
-            self._capture = False
-            self._depth = 0
+        if tag == "article":
+            self._in_article = False
+            self._article_depth = 0
+            return
+        if tag == "p" and self._in_p:
+            self._in_p = False
+            text = " ".join(self._current_p).strip()
+            if text and len(text) > 20:
+                self._paragraphs.append(text)
+                if self._in_article:
+                    self._article_text.append(text)
+            self._current_p = []
 
     def handle_data(self, data):
-        if self._capture and data.strip():
-            self._texts.append(data.strip())
+        if self._skip > 0:
+            return
+        if self._in_p:
+            self._current_p.append(data.strip())
 
 
 def extract_summary_from_html(html_text: str) -> str:
-    extractor = SummaryExtractor()
+    ex = ContentExtractor()
     try:
-        extractor.feed(html_text)
+        ex.feed(html_text)
     except Exception:
         pass
-    if extractor._meta_desc:
-        return extractor._meta_desc[:SUMMARY_MAX_CHARS]
-    text = " ".join(extractor._texts)
-    if text:
-        return text[:SUMMARY_MAX_CHARS]
-    cleaned = re.sub(r'<[^>]+>', ' ', html_text)
-    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
-    sentences = re.split(r'(?<=[.!?])\s+', cleaned)
-    summary = ""
-    for s in sentences:
-        if len(summary) + len(s) > SUMMARY_MAX_CHARS:
+
+    if ex._meta_desc and len(ex._meta_desc) > 80:
+        desc = re.sub(r'\s+', ' ', ex._meta_desc).strip()
+        return desc[:SUMMARY_MAX_CHARS]
+
+    sources = []
+    if ex._article_text:
+        sources = ex._article_text
+    elif ex._paragraphs:
+        sources = ex._paragraphs
+    else:
+        cleaned = re.sub(r'<[^>]+>', ' ', html_text)
+        cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+        sentences = re.split(r'(?<=[.!?])\s+', cleaned)
+        sources = sentences[:15]
+
+    result = []
+    char_count = 0
+    for p in sources:
+        cleaned_p = re.sub(r'\s+', ' ', p).strip()
+        if len(cleaned_p) < 15:
+            continue
+        if char_count + len(cleaned_p) > SUMMARY_MAX_CHARS:
+            remaining = SUMMARY_MAX_CHARS - char_count
+            if remaining > 40:
+                result.append(cleaned_p[:remaining])
             break
-        summary += s + " "
-    return summary.strip()[:SUMMARY_MAX_CHARS]
+        result.append(cleaned_p)
+        char_count += len(cleaned_p)
+
+    return " ".join(result)[:SUMMARY_MAX_CHARS]
 
 
 def fetch_summary(url: str, session: requests.Session) -> str:
     if not url or url.startswith("https://news.ycombinator.com/item"):
         return ""
     try:
-        r = session.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        r = session.get(
+            url, timeout=12,
+            headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"},
+        )
         r.raise_for_status()
         content_type = r.headers.get("Content-Type", "")
         if "text/html" not in content_type and "text/plain" not in content_type:
