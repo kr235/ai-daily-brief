@@ -306,11 +306,69 @@ def fetch_newsapi() -> List[Dict]:
         return []
 
 
+MODEL_KEYWORDS = [
+    "released", "launched", "announced", "unveiled", "new model", "new AI",
+    "debuts", "introduces", "open source", "open-sourced", "weights",
+    "8b", "27b", "70b", "120b", "405b", "transformer", "diffusion",
+]
+
+
+def is_model_news(title: str) -> bool:
+    t = title.lower()
+    has_ai = sum(1 for kw in AI_KEYWORDS if kw in t) >= 1
+    has_model = sum(1 for mk in MODEL_KEYWORDS if mk in t) >= 1
+    has_version = bool(re.search(r'\d+\.\d+\b', t))
+    has_b_param = bool(re.search(r'\d+b\b', t))
+    has_model_word = "model" in t or "models" in t
+    if has_ai and (has_model or has_version or has_b_param or has_model_word):
+        return True
+    return False
+
+
+def fetch_new_models() -> List[Dict]:
+    queries = [
+        "released AI model", "new AI model announced", "open source AI model",
+        "launched LLM", "new GPT", "new Claude", "new Gemini",
+    ]
+    min_ts = int((datetime.now(timezone.utc) - timedelta(days=4)).timestamp())
+    seen = set()
+    results = []
+    for q in queries:
+        try:
+            r = _session.get(
+                "https://hn.algolia.com/api/v1/search",
+                params={
+                    "query": q,
+                    "tags": "story",
+                    "hitsPerPage": 8,
+                    "numericFilters": f"created_at_i>{min_ts}",
+                },
+                timeout=12,
+            )
+            r.raise_for_status()
+            for hit in r.json().get("hits", []):
+                title = hit.get("title", "")
+                key = title.lower().strip()
+                if key not in seen and is_model_news(title):
+                    seen.add(key)
+                    results.append({
+                        "title": title,
+                        "url": hit.get("url") or f"https://news.ycombinator.com/item?id={hit.get('objectID', '')}",
+                        "source": "Hacker News",
+                        "points": (hit.get("points", 0) or 0) + 10,
+                    })
+        except Exception as e:
+            print(f"[WARN] Models search '{q}' failed: {e}")
+            continue
+    results.sort(key=lambda x: x["points"], reverse=True)
+    return results[:4]
+
+
 def fetch_all_news() -> List[Dict]:
     seen = set()
     all_news = []
 
-    fetchers = [fetch_hn_top, fetch_hn_search, fetch_devto, fetch_rss, fetch_newsapi]
+    fetchers = [fetch_new_models, fetch_hn_top, fetch_hn_search, fetch_devto, fetch_rss, fetch_newsapi]
     for fetcher in fetchers:
         for item in fetcher():
             key = item["title"].lower().strip()
@@ -320,6 +378,18 @@ def fetch_all_news() -> List[Dict]:
 
     all_news.sort(key=lambda x: x.get("points", 0), reverse=True)
     all_news = all_news[:MAX_STORIES]
+
+    model_count = sum(1 for n in all_news if is_model_news(n["title"]))
+    if model_count < 2:
+        extras = fetch_new_models()
+        for ex in extras:
+            if len(all_news) >= MAX_STORIES:
+                break
+            key = ex["title"].lower().strip()
+            if key not in seen and ex not in all_news:
+                seen.add(key)
+                all_news.append(ex)
+                model_count += 1
 
     print("Generating article summaries...")
     all_news = enrich_with_summaries(all_news)
