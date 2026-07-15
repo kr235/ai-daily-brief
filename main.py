@@ -1,11 +1,10 @@
 import os
 import sys
-import html
 import re
+import html
 import smtplib
 import ssl
 import xml.etree.ElementTree as ET
-from html.parser import HTMLParser
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -31,118 +30,17 @@ AI_KEYWORDS = [
     "cursor", "bolt", "cohere", "midjourney", "sora", "veo",
 ]
 MAX_STORIES = 10
-SUMMARY_TARGET_LINES = 8
-SUMMARY_MAX_CHARS = 900
 
 
 def keyword_score(text: str) -> int:
     return sum(1 for kw in AI_KEYWORDS if kw in text.lower())
 
 
-class ContentExtractor(HTMLParser):
-    def __init__(self):
-        super().__init__()
-        self._skip = 0
-        self._paragraphs = []
-        self._current_p = []
-        self._in_p = False
-        self._meta_desc = None
-        self._article_text = []
-        self._in_article = False
-        self._article_depth = 0
-
-    def handle_starttag(self, tag, attrs):
-        a = dict(attrs)
-        if tag == "meta":
-            n = a.get("name", "").lower()
-            p = a.get("property", "").lower()
-            if n == "description" or p == "og:description":
-                self._meta_desc = a.get("content", "")
-            return
-        if tag in ("script", "style", "noscript"):
-            self._skip += 1
-            return
-        if tag == "article":
-            self._in_article = True
-            self._article_depth = 1
-            return
-        if self._in_article and tag == "p" and self._skip == 0:
-            self._in_p = True
-            return
-        if not self._in_article:
-            if tag == "p" and self._skip == 0:
-                self._in_p = True
-            elif tag in ("div", "section") and not self._paragraphs:
-                pass
-
-    def handle_endtag(self, tag):
-        if tag in ("script", "style", "noscript"):
-            self._skip -= 1
-            return
-        if tag == "article":
-            self._in_article = False
-            self._article_depth = 0
-            return
-        if tag == "p" and self._in_p:
-            self._in_p = False
-            text = " ".join(self._current_p).strip()
-            if text and len(text) > 20:
-                self._paragraphs.append(text)
-                if self._in_article:
-                    self._article_text.append(text)
-            self._current_p = []
-
-    def handle_data(self, data):
-        if self._skip > 0:
-            return
-        if self._in_p:
-            self._current_p.append(data.strip())
-
-
-def extract_summary_from_html(html_text: str) -> str:
-    ex = ContentExtractor()
-    try:
-        ex.feed(html_text)
-    except Exception:
-        pass
-
-    if ex._meta_desc and len(ex._meta_desc) > 80:
-        desc = re.sub(r'\s+', ' ', ex._meta_desc).strip()
-        return desc[:SUMMARY_MAX_CHARS]
-
-    sources = []
-    if ex._article_text:
-        sources = ex._article_text
-    elif ex._paragraphs:
-        sources = ex._paragraphs
-    else:
-        cleaned = re.sub(r'<[^>]+>', ' ', html_text)
-        cleaned = re.sub(r'\s+', ' ', cleaned).strip()
-        sentences = re.split(r'(?<=[.!?])\s+', cleaned)
-        sources = sentences[:15]
-
-    result = []
-    char_count = 0
-    for p in sources:
-        cleaned_p = re.sub(r'\s+', ' ', p).strip()
-        if len(cleaned_p) < 15:
-            continue
-        if char_count + len(cleaned_p) > SUMMARY_MAX_CHARS:
-            remaining = SUMMARY_MAX_CHARS - char_count
-            if remaining > 40:
-                result.append(cleaned_p[:remaining])
-            break
-        result.append(cleaned_p)
-        char_count += len(cleaned_p)
-
-    return " ".join(result)[:SUMMARY_MAX_CHARS]
-
-
-def fetch_summary(url: str, session: requests.Session) -> str:
-    if not url or url.startswith("https://news.ycombinator.com/item"):
+def fetch_article_text(url: str) -> str:
+    if not url:
         return ""
     try:
-        r = session.get(
+        r = _session.get(
             url, timeout=12,
             headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"},
         )
@@ -151,28 +49,91 @@ def fetch_summary(url: str, session: requests.Session) -> str:
         if "text/html" not in content_type and "text/plain" not in content_type:
             return ""
         text = r.text
-        summary = extract_summary_from_html(text)
-        return summary
+        text = re.sub(r'<script[^>]*>.*?</script>', '', text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r'<nav[^>]*>.*?</nav>', '', text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r'<footer[^>]*>.*?</footer>', '', text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r'<header[^>]*>.*?</header>', '', text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r'<[^>]+>', ' ', text)
+        text = re.sub(r'\s+', ' ', text).strip()
+        lines = [l.strip() for l in text.split('\n') if l.strip()]
+        meaningful = [l for l in lines if len(l) > 60]
+        return " ".join(meaningful)[:5000]
     except Exception:
         return ""
 
 
+def extract_important_sentences(title: str, article_text: str, num_sentences: int = 8) -> str:
+    if not article_text:
+        return ""
+
+    sentences = re.split(r'(?<=[.!?])\s+', article_text)
+    sentences = [s.strip() for s in sentences if len(s.strip()) > 40]
+
+    if not sentences:
+        return ""
+
+    title_words = set(w.lower() for w in re.findall(r'\w+', title) if len(w) > 2)
+
+    def score(s: str, idx: int) -> float:
+        s_lower = s.lower()
+        score_val = 0.0
+        for tw in title_words:
+            if tw in s_lower:
+                score_val += 2.0
+        for kw in AI_KEYWORDS:
+            if kw in s_lower:
+                score_val += 1.5
+        score_val += max(0, 5 - idx) * 0.5
+        if len(s) > 150:
+            score_val += 0.5
+        if any(w in s_lower for w in ["according", "said", "announced", "released", "launched", "reported"]):
+            score_val += 1.0
+        return score_val
+
+    scored = [(score(s, i), i, s) for i, s in enumerate(sentences)]
+    scored.sort(key=lambda x: (-x[0], x[1]))
+
+    selected = []
+    seen_content = set()
+    for _, idx, s in scored[:num_sentences * 2]:
+        key = s[:50].lower()
+        if key not in seen_content:
+            seen_content.add(key)
+            selected.append((idx, s))
+
+    selected.sort(key=lambda x: x[0])
+    selected = selected[:num_sentences]
+
+    result = []
+    for idx, s in selected:
+        s_clean = re.sub(r'\s+', ' ', s).strip()
+        s_clean = html.unescape(s_clean)
+        result.append(s_clean)
+
+    return "\n".join(result)
+
+
+def get_article_summary(title: str, url: str) -> str:
+    text = fetch_article_text(url)
+    if not text:
+        return ""
+    summary = extract_important_sentences(title, text, 8)
+    if summary and len(summary.split('\n')) >= 3:
+        return summary
+    return ""
+
+
 def enrich_with_summaries(items: List[Dict]) -> List[Dict]:
-    with ThreadPoolExecutor(max_workers=10) as pool:
-        futs = {
-            pool.submit(fetch_summary, item["url"], _session): i
-            for i, item in enumerate(items)
-            if item.get("url")
-        }
-        for fut in as_completed(futs, timeout=30):
-            idx = futs[fut]
-            try:
-                summary = fut.result()
-                if summary:
-                    items[idx]["summary"] = summary
-            except Exception:
-                pass
-    return items
+    def process(item):
+        summary = get_article_summary(item["title"], item["url"])
+        if summary:
+            item["summary"] = summary
+        return item
+
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        results = list(pool.map(process, items))
+    return results
 
 
 def _fetch_hn_item(item_id: int, session: requests.Session) -> Optional[Dict]:
@@ -191,8 +152,8 @@ def _fetch_hn_item(item_id: int, session: requests.Session) -> Optional[Dict]:
         return {
             "title": title,
             "url": s.get("url") or f"https://news.ycombinator.com/item?id={item_id}",
-            "points": s.get("score", 0) or 0,
             "source": "Hacker News",
+            "points": s.get("score", 0) or 0,
         }
     except Exception:
         return None
@@ -213,7 +174,7 @@ def fetch_hn_top() -> List[Dict]:
                 item = fut.result()
                 if item:
                     results.append(item)
-        results.sort(key=lambda x: x["points"], reverse=True)
+        results.sort(key=lambda x: x.get("points", 0), reverse=True)
         return results[:MAX_STORIES]
     except Exception as e:
         print(f"[WARN] HN top fetch failed: {e}")
@@ -246,13 +207,13 @@ def fetch_hn_search() -> List[Dict]:
                     results.append({
                         "title": title,
                         "url": hit.get("url") or f"https://news.ycombinator.com/item?id={hit.get('objectID', '')}",
-                        "points": hit.get("points", 0) or 0,
                         "source": "Hacker News",
+                        "points": hit.get("points", 0) or 0,
                     })
         except Exception as e:
             print(f"[WARN] HN search '{q}' failed: {e}")
             continue
-    results.sort(key=lambda x: x["points"], reverse=True)
+    results.sort(key=lambda x: x.get("points", 0), reverse=True)
     return results[:MAX_STORIES]
 
 
@@ -272,8 +233,8 @@ def fetch_devto() -> List[Dict]:
                     results.append({
                         "title": title,
                         "url": art.get("url", ""),
-                        "points": art.get("positive_reactions_count", 0) or 0,
                         "source": "Dev.to",
+                        "points": art.get("positive_reactions_count", 0) or 0,
                     })
         except Exception as e:
             print(f"[WARN] Dev.to/{tag} failed: {e}")
@@ -286,7 +247,7 @@ def fetch_devto() -> List[Dict]:
         if key not in seen:
             seen.add(key)
             deduped.append(item)
-    deduped.sort(key=lambda x: x["points"], reverse=True)
+    deduped.sort(key=lambda x: x.get("points", 0), reverse=True)
     return deduped[:MAX_STORIES]
 
 
@@ -305,28 +266,13 @@ def fetch_rss() -> List[Dict]:
                 title = entry.findtext("{http://www.w3.org/2005/Atom}title", "")
                 link_el = entry.find("{http://www.w3.org/2005/Atom}link")
                 link = link_el.get("href", "") if link_el is not None else ""
-                summary_el = entry.find("{http://www.w3.org/2005/Atom}summary")
-                summary = summary_el.text if summary_el is not None else ""
                 if keyword_score(title) >= 1:
-                    results.append({
-                        "title": title,
-                        "url": link,
-                        "points": 0,
-                        "source": source_name,
-                        "summary": (summary or "")[:SUMMARY_MAX_CHARS],
-                    })
+                    results.append({"title": title, "url": link, "source": source_name, "points": 0})
             for item in root.iter("item"):
                 title = item.findtext("title", "")
                 link = item.findtext("link", "")
-                desc = item.findtext("description", "")
                 if keyword_score(title) >= 1:
-                    results.append({
-                        "title": title,
-                        "url": link,
-                        "points": 0,
-                        "source": source_name,
-                        "summary": (desc or "")[:SUMMARY_MAX_CHARS],
-                    })
+                    results.append({"title": title, "url": link, "source": source_name, "points": 0})
         except Exception as e:
             print(f"[WARN] RSS {source_name} failed: {e}")
             continue
@@ -345,7 +291,6 @@ def fetch_newsapi() -> List[Dict]:
                 "language": "en",
                 "sortBy": "popularity",
                 "pageSize": 15,
-                "from": (datetime.now(timezone.utc) - timedelta(hours=48)).strftime("%Y-%m-%dT%H:%M:%S"),
             },
             headers={"X-Api-Key": api_key},
             timeout=12,
@@ -353,13 +298,7 @@ def fetch_newsapi() -> List[Dict]:
         r.raise_for_status()
         articles = r.json().get("articles", [])
         return [
-            {
-                "title": a.get("title", ""),
-                "url": a.get("url", ""),
-                "points": 0,
-                "source": a.get("source", {}).get("name", "News"),
-                "summary": (a.get("description") or "")[:SUMMARY_MAX_CHARS],
-            }
+            {"title": a.get("title", ""), "url": a.get("url", ""), "source": a.get("source", {}).get("name", "News"), "points": 0}
             for a in articles if a.get("title") and keyword_score(a.get("title", "")) >= 1
         ]
     except Exception as e:
@@ -382,7 +321,7 @@ def fetch_all_news() -> List[Dict]:
     all_news.sort(key=lambda x: x.get("points", 0), reverse=True)
     all_news = all_news[:MAX_STORIES]
 
-    print("Enriching with article summaries...")
+    print("Generating article summaries...")
     all_news = enrich_with_summaries(all_news)
     return all_news
 
@@ -392,22 +331,27 @@ def build_email_html(news: List[Dict]) -> str:
     items_html = ""
     for i, item in enumerate(news, 1):
         safe_title = html.escape(item["title"])
-        safe_url = html.escape(item["url"])
         safe_source = html.escape(item.get("source", ""))
         summary = item.get("summary", "")
-        safe_summary = html.escape(summary) if summary else ""
-        badge = f'<span style="background:#e5e7eb;color:#374151;font-size:12px;padding:2px 8px;border-radius:4px;margin-left:8px">{safe_source}</span>'
-        score = f'<span style="color:#6b7280;font-size:13px"> | {item["points"]} pts</span>' if item.get("points") else ""
-        summary_html = f'<div style="margin-top:8px;color:#4b5563;font-size:13px;line-height:1.5;padding:10px 12px;background:#f9fafb;border-left:3px solid #93c5fd;border-radius:4px">{safe_summary}</div>' if safe_summary else ""
+        summary_html = ""
+        if summary:
+            for line in summary.split("\n"):
+                if line.strip():
+                    summary_html += f'<tr><td style="padding:2px 0;color:#374151;font-size:14px;line-height:1.65">{html.escape(line.strip())}</td></tr>\n'
+        badge = f'<span style="background:#e5e7eb;color:#374151;font-size:12px;padding:2px 8px;border-radius:4px">{safe_source}</span>'
+        no_summary_badge = '<span style="color:#9ca3af;font-size:13px;font-style:italic">Summary not available</span>' if not summary else ""
         items_html += f"""
         <tr>
-            <td style="padding:16px 20px;border-bottom:1px solid #e5e7eb">
-                <div style="margin-bottom:4px">
-                    <span style="color:#9ca3af;font-weight:600;font-size:13px;margin-right:6px">{i}.</span>
-                    <a href="{safe_url}" style="color:#1d4ed8;text-decoration:none;font-size:15px;font-weight:600;line-height:1.4" target="_blank">{safe_title}</a>
+            <td style="padding:18px 24px;border-bottom:1px solid #e5e7eb">
+                <div style="margin-bottom:6px">
+                    <span style="color:#6366f1;font-weight:700;font-size:15px">{i}.</span>
+                    <span style="color:#111827;font-size:16px;font-weight:600">{safe_title}</span>
+                    <span style="margin-left:8px">{badge}</span>
                 </div>
-                <div style="margin-bottom:2px;font-size:12px">{badge}{score}</div>
+                <table width="100%" cellpadding="0" cellspacing="0" style="margin-top:6px;padding-left:22px;border-left:3px solid #e0e7ff">
                 {summary_html}
+                </table>
+                {no_summary_badge}
             </td>
         </tr>"""
 
@@ -420,13 +364,12 @@ def build_email_html(news: List[Dict]) -> str:
 <table width="600" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:14px;overflow:hidden;box-shadow:0 4px 12px rgba(0,0,0,0.08)">
 <tr>
 <td style="background:linear-gradient(135deg,#1e40af,#7c3aed);padding:28px 32px;text-align:center">
-<img src="https://cdn-icons-png.flaticon.com/512/11866/11866939.png" width="44" height="44" alt="AI" style="vertical-align:middle;margin-bottom:8px">
-<h1 style="margin:8px 0 4px;color:#ffffff;font-size:22px;font-weight:700;letter-spacing:-0.3px">Daily AI Brief</h1>
-<p style="margin:0;color:rgba(255,255,255,0.8);font-size:14px">{date_str}</p>
+<h1 style="margin:0;color:#ffffff;font-size:22px;font-weight:700;letter-spacing:-0.3px">Daily AI Brief</h1>
+<p style="margin:4px 0 0;color:rgba(255,255,255,0.8);font-size:14px">{date_str}</p>
 </td>
 </tr>
 <tr><td style="padding:6px 24px;background:#f0f9ff;font-size:13px;color:#1e40af;text-align:center;border-bottom:1px solid #e0f2fe">
-Top {len(news)} curated AI updates with brief summaries
+Top {len(news)} AI stories — summarized for you
 </td></tr>
 <tr><td style="padding:0">
 <table width="100%" cellpadding="0" cellspacing="0">
@@ -434,7 +377,7 @@ Top {len(news)} curated AI updates with brief summaries
 </table>
 </td></tr>
 <tr><td style="padding:18px 32px;background:#f8fafc;text-align:center;font-size:12px;color:#94a3b8;border-top:1px solid #e2e8f0">
-Generated {datetime.now(IST).strftime("%I:%M %p %Z")} &bull; Your daily AI digest
+Generated {datetime.now(IST).strftime("%I:%M %p %Z")} &bull; Concise AI daily digest
 </td></tr>
 </table>
 </td></tr></table>
@@ -463,8 +406,12 @@ def send_email(news: List[Dict]):
         plain += f"{i}. [{item['source']}] {item['title']}\n"
         summary = item.get("summary", "")
         if summary:
-            plain += f"   {summary}\n"
-        plain += f"   {item['url']}\n\n"
+            for line in summary.split("\n"):
+                if line.strip():
+                    plain += f"   {line.strip()}\n"
+        else:
+            plain += "   [Summary not available]\n"
+        plain += "\n"
     plain += f"Generated at {datetime.now(IST).strftime('%I:%M %p %Z')}"
 
     msg.attach(MIMEText(plain, "plain"))
@@ -489,12 +436,13 @@ def main():
         print("ERROR: No news fetched. Skipping email.")
         sys.exit(1)
 
-    print(f"Found {len(news)} stories:")
+    print(f"\nSummarized {len(news)} stories:")
     for i, n in enumerate(news, 1):
-        summary_preview = (n.get("summary", "") or "")[:80]
-        print(f"  {i}. [{n['source']}] {n['title']} ({n.get('points', 0)} pts)")
-        if summary_preview:
-            print(f"     {summary_preview}...")
+        print(f"\n  {i}. [{n['source']}] {n['title']}")
+        summary = n.get("summary", "")
+        if summary:
+            for line in summary.split("\n"):
+                print(f"     {line.strip()}")
 
     if not os.environ.get("GMAIL_USER") or not os.environ.get("GMAIL_APP_PASSWORD"):
         print("\nSet GMAIL_USER and GMAIL_APP_PASSWORD env vars to send email.")
